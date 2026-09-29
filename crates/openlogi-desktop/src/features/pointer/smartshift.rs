@@ -201,7 +201,11 @@ impl SmartShiftPanel {
                     .child(tr!("pointer.smartshift_sensitivity_description")),
             );
 
-        let wheel_row = self.wheel_sensitivity_row(window, cx);
+        let has_thumbwheel = AppState::try_read(cx)
+            .and_then(|state| state.current_record())
+            .and_then(|record| record.capabilities)
+            .is_some_and(|caps| caps.thumbwheel);
+        let wheel_row = has_thumbwheel.then(|| self.wheel_sensitivity_row(window, cx));
 
         let permanent_row = permanent_row(permanent, ratchet, restore_threshold, status, pal);
 
@@ -211,7 +215,7 @@ impl SmartShiftPanel {
             .child(mode_row)
             .child(sensitivity_row)
             .child(permanent_row)
-            .child(wheel_row)
+            .children(wheel_row)
     }
 }
 
