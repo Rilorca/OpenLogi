@@ -130,6 +130,15 @@ pub struct MouseModelView {
     gesture_active_dir: Option<GestureDirection>,
     action_picker_open: bool,
     action_search: Entity<InputState>,
+    /// Focus target for the action library's "Record shortcut…" row — a
+    /// dedicated handle rather than `focus_handle` above, so recording a
+    /// chord doesn't also route the view's own keyboard shortcuts (Alt+Left)
+    /// while it's capturing keys.
+    shortcut_recorder_focus: FocusHandle,
+    /// Whether the "Record shortcut…" row is waiting for a keystroke. Reset
+    /// alongside every `action_picker_open` transition — recording only makes
+    /// sense while its library panel is visible.
+    recording_shortcut: bool,
     _state_obs: Subscription,
 }
 
@@ -160,6 +169,8 @@ impl MouseModelView {
             gesture_active_dir: None,
             action_picker_open: false,
             action_search,
+            shortcut_recorder_focus: cx.focus_handle(),
+            recording_shortcut: false,
             _state_obs: state_obs,
         }
     }
@@ -169,14 +180,29 @@ impl MouseModelView {
     pub(crate) fn set_gesture_selected_dir(&mut self, dir: Option<GestureDirection>) {
         self.gesture_active_dir = dir;
         self.action_picker_open = false;
+        self.recording_shortcut = false;
     }
 
     pub(super) fn toggle_action_picker(&mut self) {
         self.action_picker_open = !self.action_picker_open;
+        self.recording_shortcut = false;
     }
 
     pub(super) fn close_action_picker(&mut self) {
         self.action_picker_open = false;
+        self.recording_shortcut = false;
+    }
+
+    pub(super) fn is_recording_shortcut(&self) -> bool {
+        self.recording_shortcut
+    }
+
+    pub(super) fn start_recording_shortcut(&mut self) {
+        self.recording_shortcut = true;
+    }
+
+    pub(super) fn stop_recording_shortcut(&mut self) {
+        self.recording_shortcut = false;
     }
 
     fn reset_for_device(&mut self, device_key: Option<DeviceKey>) {
@@ -188,6 +214,7 @@ impl MouseModelView {
         self.selected = None;
         self.gesture_active_dir = None;
         self.action_picker_open = false;
+        self.recording_shortcut = false;
     }
 
     fn select(&mut self, control: MouseControlId) {
@@ -319,6 +346,8 @@ impl Render for MouseModelView {
                 dpi_gestures,
                 editing_app: editing_app.as_deref(),
                 overridden,
+                recorder_focus: &self.shortcut_recorder_focus,
+                recording_shortcut: self.recording_shortcut,
             },
             &self.action_search,
             &view,
@@ -698,6 +727,6 @@ impl RenderOnce for HotspotTrigger {
             })
     }
 }
-
 #[cfg(test)]
 mod tests;
+

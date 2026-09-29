@@ -312,7 +312,7 @@ fn step_preview(step: &WorkflowStep, pal: Palette) -> impl IntoElement {
 }
 
 fn key_combo_preview(combo: &KeyCombo) -> String {
-    combo.rendered_label()
+    combo.display_label()
 }
 
 #[cfg(test)]

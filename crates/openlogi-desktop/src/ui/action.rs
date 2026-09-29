@@ -13,9 +13,9 @@ pub(crate) fn localized_action_label(action: &Action) -> SharedString {
         Action::SetDpiPreset(index) => {
             tr!("pointer.dpi_preset", index => (index + 1).to_string())
         }
-        Action::CustomShortcut(combo) => combo.rendered_label().into(),
+        Action::CustomShortcut(combo) => combo.display_label().into(),
         Action::HoldShortcut(combo) => {
-            tr!("actions.hold_shortcut", chord => combo.rendered_label())
+            tr!("actions.hold_shortcut", chord => combo.display_label())
         }
         Action::TypeText(text) => tr!("actions.type_text_action", text => text.clone()),
         Action::RunAppleScript(_) => tr!("actions.run_applescript_heading"),

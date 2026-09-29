@@ -3,6 +3,8 @@
 use std::str::FromStr;
 
 use nutype::nutype;
+
+use crate::os::OperatingSystem;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
@@ -56,6 +58,20 @@ impl KeyboardUsage {
             0x38 => Some('/'),
             _ => None,
         }
+    }
+
+    /// Resolve a key *name* to its USB HID usage.
+    ///
+    /// Accepts the same vocabulary as the chord parser for the non-modifier
+    /// half: `a`, `7`, `f5`, `escape`, `pageup`, `left`, … Case-insensitive.
+    /// The GPUI recorder feeds its captured `keystroke.key` straight in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyComboParseError::UnknownToken`] when the name is not a key
+    /// custom shortcuts support.
+    pub fn from_name(name: &str) -> Result<Self, KeyComboParseError> {
+        parse_key(name)
     }
 
     fn label(self) -> String {
@@ -113,6 +129,30 @@ const fn validate_keyboard_usage(value: &u8) -> Result<(), KeyboardUsageError> {
         Ok(())
     } else {
         Err(KeyboardUsageError(*value))
+    }
+}
+
+/// One modifier key, for building a chord from a captured keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModifierKey {
+    /// Command on macOS, Super/Meta on Linux, Win on Windows.
+    Command,
+    /// Shift.
+    Shift,
+    /// Control.
+    Control,
+    /// Option on macOS, Alt elsewhere.
+    Option,
+}
+
+impl ModifierKey {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Command => MOD_COMMAND,
+            Self::Shift => MOD_SHIFT,
+            Self::Control => MOD_CONTROL,
+            Self::Option => MOD_OPTION,
+        }
     }
 }
 
@@ -188,6 +228,67 @@ impl<'de> Deserialize<'de> for KeyCombo {
 }
 
 impl KeyCombo {
+    /// A chord that is `key` with no modifiers held.
+    ///
+    /// This is the shortcut recorder's entry point: unlike [`FromStr`] it needs
+    /// no round trip through text, so a keystroke the user physically pressed
+    /// cannot be lost to a spelling mismatch. Add modifiers with the
+    /// `with_*` methods:
+    ///
+    /// ```
+    /// use openlogi_core::binding::{KeyCombo, KeyboardUsage};
+    ///
+    /// let key = KeyboardUsage::from_name("p").expect("p is a supported key");
+    /// let combo = KeyCombo::new(key).with_command().with_shift();
+    /// assert_eq!(combo.rendered_label(), "Cmd+Shift+P");
+    /// ```
+    #[must_use]
+    pub const fn new(key: KeyboardUsage) -> Self {
+        Self { modifiers: 0, key }
+    }
+
+    /// Add Command/Meta — the cross-platform primary modifier.
+    #[must_use]
+    pub const fn with_command(self) -> Self {
+        self.with_modifier(MOD_COMMAND)
+    }
+
+    /// Add Shift.
+    #[must_use]
+    pub const fn with_shift(self) -> Self {
+        self.with_modifier(MOD_SHIFT)
+    }
+
+    /// Add Control.
+    #[must_use]
+    pub const fn with_control(self) -> Self {
+        self.with_modifier(MOD_CONTROL)
+    }
+
+    /// Add Option/Alt.
+    #[must_use]
+    pub const fn with_option(self) -> Self {
+        self.with_modifier(MOD_OPTION)
+    }
+
+    /// Add `modifier` when `set`, so a captured modifier state maps straight
+    /// through without a chain of `if`s at every call site.
+    #[must_use]
+    pub const fn with_modifier_if(self, set: bool, modifier: ModifierKey) -> Self {
+        if set {
+            self.with_modifier(modifier.bit())
+        } else {
+            self
+        }
+    }
+
+    const fn with_modifier(self, bit: u8) -> Self {
+        Self {
+            modifiers: self.modifiers | bit,
+            key: self.key,
+        }
+    }
+
     /// USB HID keyboard usage for the ordinary key.
     #[must_use]
     pub const fn key(&self) -> KeyboardUsage {
@@ -236,6 +337,35 @@ impl KeyCombo {
         }
         if self.has_super() {
             parts.push("Super".to_string());
+        }
+        if self.has_control() {
+            parts.push("Ctrl".to_string());
+        }
+        if self.has_option() {
+            parts.push("Alt".to_string());
+        }
+        if self.has_shift() {
+            parts.push("Shift".to_string());
+        }
+        parts.push(self.key.label());
+        parts.join("+")
+    }
+
+    /// Chord label spelled the way the host OS spells it.
+    ///
+    /// Same as [`Self::rendered_label`] except the command modifier follows
+    /// [`OperatingSystem::command_modifier_label`] — `Super+D` on Linux,
+    /// `Cmd+D` on macOS, `Win+D` on Windows. Use this everywhere a user reads
+    /// the chord; `rendered_label` stays canonical for config and logs.
+    #[must_use]
+    pub fn display_label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.has_command() {
+            parts.push(
+                OperatingSystem::current()
+                    .command_modifier_label()
+                    .to_string(),
+            );
         }
         if self.has_control() {
             parts.push("Ctrl".to_string());
@@ -407,6 +537,83 @@ mod tests {
     }
 
     #[test]
+    fn new_builds_the_same_chord_the_parser_does() {
+        let recorded = KeyCombo::new(KeyboardUsage::from_name("p").expect("p is a supported key"))
+            .with_command()
+            .with_shift();
+        let parsed: KeyCombo = "Cmd+Shift+P".parse().expect("valid shortcut failed");
+        assert_eq!(recorded, parsed);
+    }
+
+    #[test]
+    fn new_without_modifiers_is_a_bare_key() {
+        let combo = KeyCombo::new(KeyboardUsage::from_name("f5").expect("f5 is a supported key"));
+        assert!(!combo.has_command());
+        assert!(!combo.has_control());
+        assert!(!combo.has_option());
+        assert!(!combo.has_shift());
+        assert_eq!(combo.rendered_label(), "F5");
+    }
+
+    #[test]
+    fn from_name_rejects_a_bare_modifier() {
+        // The recorder relies on this: while the user is still holding Ctrl,
+        // the keystroke's key is "control", which must not commit a binding.
+        KeyboardUsage::from_name("control").unwrap_err();
+        KeyboardUsage::from_name("shift").unwrap_err();
+    }
+
+    #[test]
+    fn from_name_accepts_the_gpui_key_vocabulary() {
+        // Names gpui hands the recorder in `keystroke.key`. A mismatch here
+        // silently makes a key unrecordable, so pin the whole set.
+        for name in [
+            "a",
+            "z",
+            "0",
+            "9",
+            "f1",
+            "f12",
+            "escape",
+            "enter",
+            "tab",
+            "space",
+            "backspace",
+            "delete",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "left",
+            "right",
+            "up",
+            "down",
+        ] {
+            assert!(
+                KeyboardUsage::from_name(name).is_ok(),
+                "gpui key name {name} is not recordable"
+            );
+        }
+    }
+
+    #[test]
+    fn display_label_spells_command_the_way_this_os_does() {
+        let combo: KeyCombo = "Cmd+D".parse().expect("valid shortcut failed");
+        // The canonical form never moves — it is what lands in config and logs.
+        assert_eq!(combo.rendered_label(), "Cmd+D");
+        assert_eq!(
+            combo.display_label(),
+            format!("{}+D", OperatingSystem::current().command_modifier_label())
+        );
+    }
+
+    #[test]
+    fn display_label_matches_canonical_without_the_command_modifier() {
+        let combo: KeyCombo = "Ctrl+Alt+Left".parse().expect("valid shortcut failed");
+        assert_eq!(combo.display_label(), combo.rendered_label());
+    }
+
+    #[test]
     fn parses_modifiers_letters_and_navigation_keys() {
         let combo = "Cmd+Shift+P"
             .parse::<KeyCombo>()
@@ -423,6 +630,21 @@ mod tests {
         assert!(combo.has_option());
         assert_eq!(combo.key().code(), 0x50);
         assert_eq!(combo.rendered_label(), "Ctrl+Alt+Left");
+
+        let combo = "Super+D"
+            .parse::<KeyCombo>()
+            .expect("super shortcut failed");
+        assert!(combo.has_super());
+        assert_eq!(combo.key().code(), 0x07);
+        assert_eq!(combo.rendered_label(), "Super+D");
+
+        let combo = "Super+Alt+T"
+            .parse::<KeyCombo>()
+            .expect("super alt shortcut failed");
+        assert!(combo.has_super());
+        assert!(combo.has_option());
+        assert_eq!(combo.key().code(), 0x17);
+        assert_eq!(combo.rendered_label(), "Super+Alt+T");
     }
 
     #[test]

@@ -4,15 +4,17 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, Role,
-    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgb, svg,
+    Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
+    Role, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_base::Button as BaseButton;
 use gpui_component::{
     Disableable as _, Icon, IconName, Selectable as _, Sizable as _, button::Button, h_flex,
     input::InputState, scroll::ScrollableElement as _, v_flex,
 };
-use openlogi_core::binding::{Action, ButtonId, GestureDirection, default_binding};
+use openlogi_core::binding::{
+    Action, ButtonId, GestureDirection, KeyCombo, KeyboardUsage, ModifierKey, default_binding,
+};
 
 use super::hotspots::MouseControlId;
 use super::thumbwheel::ThumbwheelPreset;
@@ -38,6 +40,10 @@ pub(super) struct BindingInspectorData<'a> {
     pub dpi_gestures: bool,
     pub editing_app: Option<&'a str>,
     pub overridden: Option<&'a BTreeMap<ButtonId, Action>>,
+    /// Focus target for the "Record shortcut…" row — see
+    /// [`MouseModelView::is_recording_shortcut`].
+    pub recorder_focus: &'a FocusHandle,
+    pub recording_shortcut: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +51,8 @@ struct ActionPickerContext<'a> {
     open: bool,
     search: &'a Entity<InputState>,
     view: &'a Entity<MouseModelView>,
+    recorder_focus: &'a FocusHandle,
+    recording: bool,
 }
 
 pub(super) fn binding_inspector(
@@ -58,6 +66,8 @@ pub(super) fn binding_inspector(
         open: data.action_picker_open,
         search: action_search,
         view,
+        recorder_focus: data.recorder_focus,
+        recording: data.recording_shortcut,
     };
     let body = match data.selected {
         None => empty_inspector(
@@ -223,8 +233,8 @@ fn button_inspector(
             panel.child(action_library(
                 "inspector-action",
                 Some(&action),
-                picker.search,
                 &on_pick,
+                picker,
                 pal,
                 cx,
             ))
@@ -276,8 +286,8 @@ fn inherited_gesture_inspector(
             panel.child(action_library(
                 "inspector-gesture-override",
                 None,
-                picker.search,
                 &on_pick,
+                picker,
                 pal,
                 cx,
             ))
@@ -337,8 +347,8 @@ fn gesture_inspector(
             panel.child(action_library(
                 "inspector-gesture-action",
                 Some(&current),
-                picker.search,
                 &on_pick,
+                picker,
                 pal,
                 cx,
             ))
@@ -646,18 +656,19 @@ fn selection_card(
 fn action_library(
     id_prefix: &'static str,
     current: Option<&Action>,
-    action_search: &Entity<InputState>,
     on_pick: &PickFn,
+    picker: ActionPickerContext<'_>,
     pal: Palette,
     cx: &Context<MouseModelView>,
 ) -> impl IntoElement {
-    let query = action_search.read(cx).value();
+    let query = picker.search.read(cx).value();
     let rows = action_rows_matching(id_prefix, current, &query, on_pick, pal);
     v_flex()
         .gap_2()
         .pt_1()
         .child(editor_section(tr!("actions.actions"), pal))
-        .child(control_input(action_search).cleanable(true))
+        .child(record_shortcut_row(id_prefix, on_pick, picker, pal))
+        .child(control_input(picker.search).cleanable(true))
         .child(
             v_flex()
                 .gap_0p5()
@@ -672,6 +683,105 @@ fn action_library(
                 })
                 .children(rows),
         )
+}
+
+/// Translate one captured keystroke into a chord.
+///
+/// `None` for a keystroke that is not a bindable chord: a bare modifier press
+/// (the user is still assembling the combination, so `keystroke.key` is
+/// `"shift"`, `"ctrl"`, …), or a key custom shortcuts don't model. Both cases
+/// mean "keep waiting", not "commit something wrong".
+fn combo_from_keystroke(keystroke: &gpui::Keystroke) -> Option<KeyCombo> {
+    let key = KeyboardUsage::from_name(&keystroke.key).ok()?;
+    let modifiers = &keystroke.modifiers;
+    Some(
+        KeyCombo::new(key)
+            // gpui calls this `platform`: Command on macOS, Win on Windows,
+            // Super on Linux — exactly what `KeyCombo` models as "command".
+            .with_modifier_if(modifiers.platform, ModifierKey::Command)
+            .with_modifier_if(modifiers.shift, ModifierKey::Shift)
+            .with_modifier_if(modifiers.control, ModifierKey::Control)
+            .with_modifier_if(modifiers.alt, ModifierKey::Option),
+    )
+}
+
+/// The "Record shortcut…" row: click it, then press the chord you want bound.
+///
+/// This is the escape hatch [`Action::CustomShortcut`] exists for — any chord
+/// the user can physically press, not a fixed list. Escape cancels; a bare
+/// modifier press is ignored so the user can hold Ctrl+Shift before landing on
+/// the final key. Picking a chord goes through the same `on_pick` every other
+/// row in the library uses, so it commits and closes the picker identically.
+fn record_shortcut_row(
+    id_prefix: &'static str,
+    on_pick: &PickFn,
+    picker: ActionPickerContext<'_>,
+    pal: Palette,
+) -> impl IntoElement {
+    let recording = picker.recording;
+    let label = if recording {
+        tr!("Press a shortcut…")
+    } else {
+        tr!("Record shortcut…")
+    };
+    let view_click = picker.view.clone();
+    let focus_click = picker.recorder_focus.clone();
+    let view_key = picker.view.clone();
+    let on_pick_key = on_pick.clone();
+
+    MenuRow::new(format!("{id_prefix}-record-shortcut"))
+        .selected(recording)
+        .role(Role::MenuItem)
+        .aria_label(label.clone())
+        .track_focus(picker.recorder_focus)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    svg()
+                        .path("action-icons/keyboard.svg")
+                        .size_4()
+                        .flex_none()
+                        .text_color(if recording {
+                            rgb(ACCENT_BLUE).into()
+                        } else {
+                            pal.text_muted
+                        }),
+                )
+                .child(div().child(label)),
+        )
+        .on_click(move |_event, window, cx| {
+            view_click.update(cx, |view, cx| {
+                view.start_recording_shortcut();
+                cx.notify();
+            });
+            window.focus(&focus_click, cx);
+        })
+        .on_key_down(move |event: &KeyDownEvent, window, cx| {
+            if !view_key.read(cx).is_recording_shortcut() {
+                return;
+            }
+            // Escape cancels rather than binding Escape itself. Binding Escape
+            // to a mouse button is possible via a chord (Shift+Escape); giving
+            // the bare key to "cancel" is the convention every recorder uses.
+            if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                view_key.update(cx, |view, cx| {
+                    view.stop_recording_shortcut();
+                    cx.notify();
+                });
+                return;
+            }
+            let Some(combo) = combo_from_keystroke(&event.keystroke) else {
+                // Bare modifier or unsupported key — keep waiting.
+                return;
+            };
+            view_key.update(cx, |view, cx| {
+                view.stop_recording_shortcut();
+                cx.notify();
+            });
+            (on_pick_key)(Action::CustomShortcut(combo), window, cx);
+        })
 }
 
 fn gesture_action(

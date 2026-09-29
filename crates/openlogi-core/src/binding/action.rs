@@ -307,7 +307,7 @@ macro_rules! derive_action_core {
                 match self {
                     $( Action::$variant => $label.into(), )*
                     Action::SetDpiPreset(i) => format!("DPI Preset {}", i + 1),
-                    Action::CustomShortcut(combo) => combo.rendered_label(),
+                    Action::CustomShortcut(combo) => combo.display_label(),
                     Action::TypeText(s) => format!("Type \"{s}\""),
                     Action::RunAppleScript(_) => "Run AppleScript".into(),
                     Action::RunShellCommand(_) => "Run Command".into(),
