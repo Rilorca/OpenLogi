@@ -19,7 +19,9 @@ use openlogi_core::config::ScrollResolution;
 use openlogi_core::device::DeviceKind;
 use openlogi_core::hid::DeviceRoute;
 
-use super::widgets::{back_button, kind_label, route_label, sidebar_action, status_badge};
+use super::widgets::{
+    back_button, kind_label, os_badge_button, route_label, sidebar_action, status_badge,
+};
 use super::{AppView, DetailTab};
 use crate::app::menu::file_url;
 use crate::features::action_ring::ActionRingPanel;
@@ -85,6 +87,7 @@ pub(super) fn detail_header(
         .child(div().flex_1())
         .children(battery)
         .when_some(online, |this, online| this.child(status_badge(online, pal)))
+        .child(os_badge_button())
 }
 
 /// Long-lived child panels rendered by the device workspace.

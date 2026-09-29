@@ -59,6 +59,13 @@ fn about_hero(view: &Entity<SettingsView>, copied: bool, cx: &mut App) -> gpui::
                                 .text_body()
                                 .text_color(pal.text_muted)
                                 .child(env!("CARGO_PKG_VERSION")),
+                        )
+                        .child(div().text_caption().text_color(pal.text_muted).child("·"))
+                        .child(
+                            div()
+                                .text_caption()
+                                .text_color(pal.text_muted)
+                                .child(openlogi_core::os::SystemEnvironment::detect().summary()),
                         ),
                 )
                 .child(

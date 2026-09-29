@@ -15,6 +15,7 @@ use zbus::blocking::Connection as DbusConn;
 use openlogi_core::binding::{
     Action, Effect, KeyCombo, MediaKey, MouseButton, NativeAction, Shortcut,
 };
+use openlogi_core::os::LinuxDesktop;
 use openlogi_core::scroll::ScrollDelta;
 
 use super::{HeldKey, KeyPhase, QuantizedScroll, ScrollQuantizer};
@@ -130,32 +131,85 @@ fn dispatch_media(key: MediaKey) {
 
 /// Dispatch a window-manager or power [`NativeAction`]. `action` is only
 /// used for its label in the "no Linux equivalent" debug log.
-fn dispatch_native(action: &Action, native: NativeAction) {
-    let ctrl = KeyCode::KEY_LEFTCTRL;
-    let alt = KeyCode::KEY_LEFTALT;
+/// Dispatch a window-manager or power [`NativeAction`]. macOS window-manager
+/// concepts map dynamically to the active Linux desktop environment shortcuts.
+fn dispatch_native(_action: &Action, native: NativeAction) {
+    let desktop = LinuxDesktop::current();
     match native {
-        // No universal Linux equivalent; the compositor shortcut varies.
-        NativeAction::MissionControl
-        | NativeAction::AppExpose
-        | NativeAction::ShowDesktop
-        | NativeAction::LaunchpadShow => {
-            tracing::debug!(
-                action = action.label(),
-                "no Linux equivalent — action skipped"
-            );
-        }
-        // Ctrl+Alt+←/→ is the default in GNOME and KDE.
-        NativeAction::PreviousDesktop => press_key(&[ctrl, alt], KeyCode::KEY_LEFT),
-        NativeAction::NextDesktop => press_key(&[ctrl, alt], KeyCode::KEY_RIGHT),
         // logind LockSession() via the system bus; falls back to Super+L.
         NativeAction::LockScreen => lock_screen(),
-        // Region vs full-screen capture depends on the desktop environment's
-        // screenshot handler for Print Screen, so both map to the same key.
-        NativeAction::Screenshot | NativeAction::CaptureRegion => {
-            press_key(&[], KeyCode::KEY_SYSRQ);
-        }
         // logind Suspend() via the system bus.
         NativeAction::Sleep => sleep_system(),
+        native => {
+            let (mods, key) = native_action_chord(native, &desktop);
+            press_key(&mods, key);
+        }
+    }
+}
+
+/// Modifiers + key that dispatch `native` on `desktop`.
+///
+/// Pulled out of [`dispatch_native`] so the desktop-specific mapping is
+/// unit-testable without a virtual uinput device: it is exactly the part
+/// that has been wrong before — [`NativeAction::PreviousDesktop`] /
+/// [`NativeAction::NextDesktop`] sent `Ctrl+Alt+Left/Right` on KDE, which
+/// KWin's default keybindings never bind to virtual-desktop navigation (see
+/// `~/.config/kglobalshortcutsrc`'s `[kwin]` section: `Switch to Next/Previous
+/// Desktop` ships unbound there; the bound action is the differently-named
+/// "Switch One Desktop to the Left/Right", on `Meta+Ctrl+Left/Right`). Never
+/// called for [`NativeAction::LockScreen`] / [`NativeAction::Sleep`], which
+/// go over D-Bus instead of a keystroke.
+fn native_action_chord(native: NativeAction, desktop: &LinuxDesktop) -> (Vec<KeyCode>, KeyCode) {
+    let ctrl = KeyCode::KEY_LEFTCTRL;
+    let alt = KeyCode::KEY_LEFTALT;
+    let meta = KeyCode::KEY_LEFTMETA;
+
+    match native {
+        // Mission Control / Overview: Super on GNOME; Ctrl+F10 on KDE; Ctrl+Alt+Up / Super on Cinnamon/XFCE.
+        NativeAction::MissionControl => match desktop {
+            LinuxDesktop::Kde => (vec![ctrl], KeyCode::KEY_F10),
+            LinuxDesktop::Cinnamon | LinuxDesktop::Xfce | LinuxDesktop::Mate => {
+                (vec![ctrl, alt], KeyCode::KEY_UP)
+            }
+            // GNOME opens the overview on a bare Super, and it is the least
+            // surprising guess for an unrecognised compositor too.
+            _ => (vec![], meta),
+        },
+        // App Exposé / Window Switcher: Super / Alt+Tab on GNOME; Ctrl+F9 on KDE.
+        NativeAction::AppExpose => match desktop {
+            LinuxDesktop::Gnome => (vec![], meta),
+            LinuxDesktop::Kde => (vec![ctrl], KeyCode::KEY_F9),
+            _ => (vec![alt], KeyCode::KEY_TAB),
+        },
+        // Show Desktop: Super+D is universal across GNOME, KDE, Cinnamon, XFCE, MATE.
+        NativeAction::ShowDesktop => (vec![meta], KeyCode::KEY_D),
+        // Launchpad / App Grid: Super+A on GNOME, Super on others.
+        NativeAction::LaunchpadShow => match desktop {
+            LinuxDesktop::Gnome => (vec![meta], KeyCode::KEY_A),
+            _ => (vec![], meta),
+        },
+        // Previous / Next Workspace: Super+PageUp/PageDown on GNOME;
+        // Meta+Ctrl+Left/Right on KDE ("Switch One Desktop to the
+        // Left/Right" — KWin's stock binding; the differently-named "Switch
+        // to Next/Previous Desktop" action exists but ships unbound); Ctrl+Alt
+        // +Left/Right on Cinnamon/XFCE/MATE.
+        NativeAction::PreviousDesktop => match desktop {
+            LinuxDesktop::Gnome => (vec![meta], KeyCode::KEY_PAGEUP),
+            LinuxDesktop::Kde => (vec![meta, ctrl], KeyCode::KEY_LEFT),
+            _ => (vec![ctrl, alt], KeyCode::KEY_LEFT),
+        },
+        NativeAction::NextDesktop => match desktop {
+            LinuxDesktop::Gnome => (vec![meta], KeyCode::KEY_PAGEDOWN),
+            LinuxDesktop::Kde => (vec![meta, ctrl], KeyCode::KEY_RIGHT),
+            _ => (vec![ctrl, alt], KeyCode::KEY_RIGHT),
+        },
+        // Region vs full-screen capture depends on the desktop environment's
+        // screenshot handler for Print Screen, so both map to the same key.
+        NativeAction::Screenshot | NativeAction::CaptureRegion => (vec![], KeyCode::KEY_SYSRQ),
+        // Handled in `dispatch_native` before this function is called.
+        NativeAction::LockScreen | NativeAction::Sleep => {
+            unreachable!("LockScreen/Sleep dispatch over D-Bus, not a chord")
+        }
     }
 }
 
@@ -409,25 +463,22 @@ pub(super) fn device_node() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Convert a [`KeyCombo`] modifier bitmask
-/// to the evdev keys to hold.
+/// Convert a [`KeyCombo`] modifier bitmask to the evdev keys to hold.
 ///
-/// macOS Cmd (`MOD_CMD`) and Ctrl (`MOD_CTRL`) both map to `KEY_LEFTCTRL`;
-/// the bitwise-OR check deduplicates them so at most one Ctrl is pushed.
-/// Order is canonical: Ctrl → Shift → Alt.
+/// Order is canonical: Super → Ctrl → Alt → Shift.
 fn modifiers_to_keycodes(combo: &openlogi_core::binding::KeyCombo) -> Vec<KeyCode> {
     let mut modifiers = Vec::new();
-    if combo.has_command() || combo.has_control() {
-        modifiers.push(KeyCode::KEY_LEFTCTRL);
+    if combo.has_command() || combo.has_super() {
+        modifiers.push(KeyCode::KEY_LEFTMETA);
     }
-    if combo.has_shift() {
-        modifiers.push(KeyCode::KEY_LEFTSHIFT);
+    if combo.has_control() {
+        modifiers.push(KeyCode::KEY_LEFTCTRL);
     }
     if combo.has_option() {
         modifiers.push(KeyCode::KEY_LEFTALT);
     }
-    if combo.has_super() {
-        modifiers.push(KeyCode::KEY_LEFTMETA);
+    if combo.has_shift() {
+        modifiers.push(KeyCode::KEY_LEFTSHIFT);
     }
     modifiers
 }
@@ -671,9 +722,13 @@ fn try_mpris_command(command: &str) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use evdev::KeyCode;
-    use openlogi_core::binding::{KeyCombo, Shortcut};
+    use openlogi_core::binding::{KeyCombo, NativeAction, Shortcut};
+    use openlogi_core::os::LinuxDesktop;
 
-    use super::{combo, hid_usage_to_linux, key_ev, key_phase_events, modifiers_to_keycodes, syn};
+    use super::{
+        combo, hid_usage_to_linux, key_ev, key_phase_events, modifiers_to_keycodes,
+        native_action_chord, syn,
+    };
     use crate::inject::KeyPhase;
 
     #[test]
@@ -700,17 +755,26 @@ mod tests {
     }
 
     #[test]
-    fn modifiers_map_to_linux_without_duplicate_control() {
-        let combo = "Cmd+Ctrl+Shift+Alt+A"
+    fn modifiers_map_to_linux_with_super_ctrl_alt_shift() {
+        let combo = "Super+Ctrl+Shift+Alt+A"
             .parse::<KeyCombo>()
             .expect("a valid shortcut must parse");
         assert_eq!(
             modifiers_to_keycodes(&combo),
             vec![
+                KeyCode::KEY_LEFTMETA,
                 KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_LEFTALT,
                 KeyCode::KEY_LEFTSHIFT,
-                KeyCode::KEY_LEFTALT
             ]
+        );
+
+        let combo = "Ctrl+Shift+C"
+            .parse::<KeyCombo>()
+            .expect("a valid shortcut must parse");
+        assert_eq!(
+            modifiers_to_keycodes(&combo),
+            vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT]
         );
     }
 
@@ -746,5 +810,49 @@ mod tests {
                 "{shortcut:?} table entry has no Linux keycode mapping"
             );
         }
+    }
+
+    /// Regression test: KDE's stock `kglobalshortcutsrc` leaves the
+    /// literally-named "Switch to Next/Previous Desktop" action unbound and
+    /// instead binds virtual-desktop navigation to "Switch One Desktop to the
+    /// Left/Right" on `Meta+Ctrl+Left/Right`. Sending `Ctrl+Alt+Left/Right`
+    /// (the GNOME-derived desktops' convention) therefore does nothing on a
+    /// stock KDE Plasma session — confirmed against a real
+    /// `~/.config/kglobalshortcutsrc`, not just documentation.
+    #[test]
+    fn kde_previous_next_desktop_uses_meta_ctrl_not_ctrl_alt() {
+        let (mods, key) = native_action_chord(NativeAction::PreviousDesktop, &LinuxDesktop::Kde);
+        assert_eq!(mods, vec![KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTCTRL]);
+        assert_eq!(key, KeyCode::KEY_LEFT);
+
+        let (mods, key) = native_action_chord(NativeAction::NextDesktop, &LinuxDesktop::Kde);
+        assert_eq!(mods, vec![KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTCTRL]);
+        assert_eq!(key, KeyCode::KEY_RIGHT);
+    }
+
+    #[test]
+    fn gnome_derived_desktops_keep_ctrl_alt_for_previous_next_desktop() {
+        // Cinnamon, XFCE and MATE inherit GNOME 2's Ctrl+Alt+Left/Right
+        // workspace-switch convention; only KDE and GNOME itself differ.
+        for desktop in [
+            LinuxDesktop::Cinnamon,
+            LinuxDesktop::Xfce,
+            LinuxDesktop::Mate,
+        ] {
+            let (mods, key) = native_action_chord(NativeAction::PreviousDesktop, &desktop);
+            assert_eq!(
+                mods,
+                vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTALT],
+                "{desktop:?}"
+            );
+            assert_eq!(key, KeyCode::KEY_LEFT, "{desktop:?}");
+        }
+    }
+
+    #[test]
+    fn gnome_previous_next_desktop_uses_super_page_keys() {
+        let (mods, key) = native_action_chord(NativeAction::PreviousDesktop, &LinuxDesktop::Gnome);
+        assert_eq!(mods, vec![KeyCode::KEY_LEFTMETA]);
+        assert_eq!(key, KeyCode::KEY_PAGEUP);
     }
 }

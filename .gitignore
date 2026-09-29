@@ -70,3 +70,7 @@ node_modules/
 
 # Packaging output.
 *.dmg
+
+# Graphify output
+/graphify-out/
+

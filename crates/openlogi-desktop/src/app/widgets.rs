@@ -41,8 +41,21 @@ pub(super) fn settings_button() -> impl IntoElement {
         .on_click(|_, _, cx| crate::windows::settings::open(cx))
 }
 
-/// Primary action that opens the pairing window. The empty state carries its
-/// own equivalent CTA, so this never floats alone in an empty header.
+/// OS / Environment pill badge in top bar: shows detected OS and DE.
+pub(super) fn os_badge_button() -> impl IntoElement {
+    let env_summary = openlogi_core::os::SystemEnvironment::detect().summary();
+    Button::new("header-os-badge")
+        .ghost()
+        .small()
+        .icon(IconName::Info)
+        .label(env_summary.clone())
+        .tooltip(format!("{}: {}", tr!("Operating System"), env_summary))
+        .on_click(|_, _, cx| crate::windows::settings::open(cx))
+}
+
+/// Trailing "+" button that opens the pairing window. Present in both screen
+/// headers; the empty state carries its own primary "Add Device" CTA, so this
+/// never floats alone in an empty header.
 pub(super) fn add_device_button() -> impl IntoElement {
     Button::new("header-add-device")
         .primary()
